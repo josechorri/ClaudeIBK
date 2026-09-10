@@ -57,7 +57,7 @@ S3_DIAG         = "s3://ibk-discovery-ba-us-east-1-992382582498-data/discovery/a
 ESCRIBIR_DIAG   = True              # además de la lista consolidada, escribir el detalle por combinación
 
 PARAM_CODMES    = "202606"          # mes de evaluación (yyyymm). Las ventanas son los meses PREVIOS.
-VENTANAS        = [6, 12, 18, 24]   # ventanas históricas a evaluar
+VENTANAS        = [6]               # ventana ESTÁNDAR: una sola ventana de 6 meses
 ESCALA_LOG      = True              # detección en escala log10 (recomendado para datos multiplicativos)
 
 # --- Parámetros del método base (fallback IQR/MAD) ---
