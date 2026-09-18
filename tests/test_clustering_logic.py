@@ -33,7 +33,7 @@ sqlmod.functions = fmod; sqlmod.types = tmod
 g = {"__name__": "outliers_mod", "spark": object()}
 exec(head, g)
 analizar_combinacion = g["analizar_combinacion"]
-_elegir_k_codo = g["_elegir_k_codo"]
+_segmentar = g["_segmentar"]
 
 
 def make_pdf(valores, dia=1, ventana=24, metrica="ENVIOS"):
@@ -84,10 +84,45 @@ def main():
     assert out6.metodo.iloc[0] == "CLUSTER"
     print("OK  valores 0 -> guard log OK, ceros BAJO=%s" % out6[out6.valor_mes == 0.0].es_outlier.tolist())
 
-    # --- Reproducibilidad del codo ---
-    k, _ = _elegir_k_codo(np.log10(np.array(valores)), 5, 42, 20)
+    # --- Método del codo (motor DP) ---
+    k, labels, centers, sizes = _segmentar(np.log10(np.array(valores)), 5, "DP", 42, 20)
     assert k == 2
-    print("OK  método del codo reproducible (k=2)")
+    print("OK  método del codo (DP) reproducible (k=2)")
+
+    # --- Equivalencia DP ≡ SKLEARN sobre casos variados (misma decisión de outliers) ---
+    rng = np.random.default_rng(7)
+    KEY = ["metodo", "k_elegido", "cluster_rank", "es_outlier", "tipo",
+           "frontera_inf_log", "frontera_sup_log", "limite_inf", "limite_sup"]
+    mm = 0
+    for _ in range(150):
+        n = int(rng.integers(6, 25))
+        kind = rng.integers(0, 5)
+        if kind == 0:
+            v = np.abs(rng.normal(50000, 8000, n))
+        elif kind == 1:
+            v = np.concatenate([[rng.uniform(50, 500)], rng.uniform(80000, 200000, n - 1)])
+        elif kind == 2:
+            v = np.concatenate([rng.uniform(1000, 3000, n - 1), [rng.uniform(3e5, 9e5)]])
+        elif kind == 3:
+            v = np.concatenate([rng.uniform(1000, 2000, n // 2), rng.uniform(9e4, 12e4, n - n // 2)])
+        else:
+            v = 10 ** rng.uniform(2, 5.5, n)
+        pdf = make_pdf([float(x) for x in v])
+        g["MOTOR_CLUSTER"] = "DP";      od = g["analizar_combinacion"](pdf)
+        g["MOTOR_CLUSTER"] = "SKLEARN"; os_ = g["analizar_combinacion"](pdf)
+        g["MOTOR_CLUSTER"] = "DP"
+        for c in KEY:
+            a, b = od[c], os_[c]
+            if a.dtype.kind in "fc":
+                eq = np.allclose(a.fillna(-999).values, b.fillna(-999).values, rtol=1e-6, atol=1e-9)
+            else:
+                eq = (a.astype(object).where(a.notna(), None).tolist()
+                      == b.astype(object).where(b.notna(), None).tolist())
+            if not eq:
+                mm += 1
+                break
+    assert mm == 0, f"DP y SKLEARN difieren en {mm} casos"
+    print("OK  equivalencia DP ≡ SKLEARN (150 casos, misma detección)")
 
     print("\nTODOS LOS CHECKS PASARON")
 

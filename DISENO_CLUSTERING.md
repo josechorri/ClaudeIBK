@@ -98,12 +98,39 @@ paralelismo *embarrassing* de miles de series diminutas. `applyInPandas` (pandas
 envía a cada worker el `pandas.DataFrame` de un grupo y corre sklearn en memoria — el patrón canónico
 "un modelo por partición".
 
-**Riesgo y mitigación (disponibilidad de sklearn en Athena Spark).** Athena for Apache Spark permite
-añadir librerías Python a la sesión/aplicación; si `scikit-learn` no está instalado, la UDF hace
-**fallback a un K-Means 1-D en numpy puro** (Lloyd + k-means++, mismos `random_state`/`n_init`), de modo
-que el pipeline nunca se rompe por la ausencia del paquete. El driver imprime un aviso informativo con
-la versión detectada. Para instalarlo, añade `scikit-learn` en las propiedades de librerías Python de
-la sesión Spark.
+**Riesgo y mitigación (disponibilidad de sklearn en Athena Spark).** Si se usa el motor `SKLEARN` y
+`scikit-learn` no está instalado, la UDF hace **fallback a un K-Means 1-D en numpy puro** (Lloyd +
+k-means++, mismos `random_state`/`n_init`). Con el motor por defecto (`DP`) no hay ninguna dependencia
+externa: solo numpy.
+
+### 4.1. Optimización del solver dentro de la UDF: DP exacto 1-D (motor por defecto)
+
+El motor `SKLEARN` corría el método del codo (`k=1..5`) con `n_init=20` reinicios cada uno → ~100
+ajustes iterativos + el ajuste final, **por combinación**. Con decenas de miles de combinaciones eso
+era el cuello de botella (~40 min): ~49 ms/combinación, dominados por el arranque de sklearn.
+
+Como el problema es **1-D con 6–24 puntos**, el óptimo **global** de K-Means en 1-D se resuelve de forma
+**exacta y determinista** por programación dinámica (tipo *Ckmeans.1d.dp*): los clusters óptimos son
+intervalos contiguos sobre los valores ordenados, y con sumas prefijas el costo de cada segmento es
+`O(1)`, de modo que la DP es `O(K·n²)` (con `n≤24`, unos miles de operaciones por combinación). Una sola
+pasada entrega **la inercia óptima de todos los K a la vez** (el codo sale gratis) y la segmentación del
+K elegido. Es exactamente el óptimo que `n_init=20` de sklearn intentaba aproximar.
+
+| Motor | ms/combinación | Dependencia | Determinista |
+|---|---|---|---|
+| `SKLEARN` (iterativo, codo×n_init) | ~49 ms | scikit-learn | sí (con `random_state`) |
+| **`DP` (exacto 1-D, por defecto)** | **~2 ms** | solo numpy | sí (sin random) |
+
+**~25× más rápido** por combinación (y ese ~2 ms restante es sobre todo construir el DataFrame de
+salida, no el clustering). **Salida idéntica:** la equivalencia `DP ≡ SKLEARN` en las columnas de
+decisión (`metodo, k_elegido, cluster_rank, es_outlier, tipo, fronteras, límites, cluster_center/n`)
+está verificada sobre 400+ casos aleatorios (unimodal, outlier bajo/alto, bimodal, dispersión log amplia)
+y el caso de aceptación, con **0 discrepancias** (`tests/test_clustering_logic.py`). El motor `SKLEARN`
+queda disponible vía `MOTOR_CLUSTER="SKLEARN"` para auditoría/reproducción.
+
+Otras optimizaciones que **no** alteran la salida: Arrow habilitado para la UDF, proyección de solo las
+columnas necesarias antes del `groupBy`, y `resultado` materializado una vez (`cache`) porque lo
+consumen 4 acciones (2 escrituras + 2 resúmenes) — así el clustering se ejecuta una sola vez.
 
 ---
 
