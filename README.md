@@ -22,3 +22,21 @@ python3 tests/test_clustering_logic.py
 
 `Venta TC / Marketing Contextual / Ventas / HTML / ENVIOS / Lunes`, enero ≈ 191 envíos con el resto de
 meses > 100 000 → el clustering aísla enero como **outlier BAJO** (verificado en las pruebas).
+
+## Corrida recurrente mensual (tabla acumulada)
+
+Las tablas de salida son **permanentes y acumuladas**, particionadas por `(codmes_val, ventana_meses)`:
+
+- Cada corrida escribe el mes indicado en `PARAM_CODMES` reemplazando **solo** su partición
+  (`spark.sql.sources.partitionOverwriteMode=dynamic` + `insertInto`); los meses anteriores se
+  conservan. Re-correr el mismo mes es **idempotente**.
+- La primera corrida **crea** la tabla; las siguientes **insertan/actualizan** su mes.
+- `AUTO_CODMES=True` deriva `PARAM_CODMES` como el mes calendario anterior a hoy — útil para programar
+  la ejecución mensual sin editar el script.
+- **Migración desde la versión previa** (que particionaba solo por `ventana_meses` y hacía `DROP`+
+  overwrite): la primera corrida detecta el esquema de partición distinto y **recrea** la tabla con el
+  nuevo particionado. Conviene que el prefijo S3 esté limpio (o usar uno nuevo) para no mezclar el
+  layout de directorios antiguo con el nuevo.
+
+Tablas: `Lista_Outliers_Consolidado_DA` (outliers) y `Detalle_Clusters_Outliers_DA` (detalle por
+combinación). El script imprime al final los `codmes_val` ya almacenados como verificación.

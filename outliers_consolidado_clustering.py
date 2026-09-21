@@ -72,20 +72,41 @@ except NameError:
 try:
     spark.conf.set("spark.sql.execution.arrow.pyspark.enabled", "true")
     spark.conf.set("spark.sql.execution.arrow.pyspark.fallback.enabled", "true")
+    # OVERWRITE DINÁMICO DE PARTICIONES: al re-escribir una tabla particionada, solo se reemplazan
+    # las particiones presentes en los datos entrantes (el mes que se está corriendo), conservando
+    # los demás meses ya almacenados. Es lo que permite ACUMULAR mes a mes y re-correr un mes de
+    # forma idempotente.
+    spark.conf.set("spark.sql.sources.partitionOverwriteMode", "dynamic")
+    spark.conf.set("hive.exec.dynamic.partition", "true")
+    spark.conf.set("hive.exec.dynamic.partition.mode", "nonstrict")
 except Exception:
     pass
 
 # =========================== CONFIGURACIÓN ===========================
 TABLA_FUENTE    = "disc_analyst_intcam.t_ds_agg_comunicaciones"
-TABLA_OUTLIERS  = "disc_analyst_intcam.Lista_Outliers_Consolidado_DA"           # outliers consolidados
-TABLA_DIAG      = "disc_analyst_intcam.Detalle_Clusters_Outliers_DA"            # detalle mes×combinación (diagnóstico)
+TABLA_OUTLIERS  = "disc_analyst_intcam.Lista_Outliers_Consolidado_DA"           # outliers consolidados (ACUMULADA)
+TABLA_DIAG      = "disc_analyst_intcam.Detalle_Clusters_Outliers_DA"            # detalle mes×combinación (ACUMULADA)
 S3_OUTLIERS     = "s3://ibk-discovery-ba-us-east-1-992382582498-data/discovery/anl_intcam/BP3616/Outliers/lista_outliers_consolidado"
 S3_DIAG         = "s3://ibk-discovery-ba-us-east-1-992382582498-data/discovery/anl_intcam/BP3616/Outliers/detalle_clusters"
 ESCRIBIR_DIAG   = True              # además de la lista consolidada, escribir el detalle por combinación
 
+# Tablas PERMANENTES ACUMULADAS: se particionan por (codmes_val, ventana_meses). Cada corrida mensual
+# solo crea/reemplaza la partición de su propio mes (codmes_val) gracias al overwrite dinámico de
+# particiones; los meses anteriores permanecen. Re-correr el mismo mes es idempotente.
+PART_COLS       = ["codmes_val", "ventana_meses"]
+
 PARAM_CODMES    = "202606"          # mes de evaluación (yyyymm). Las ventanas son los meses PREVIOS.
+AUTO_CODMES     = False             # True -> ignora PARAM_CODMES y usa el MES ANTERIOR al actual
+                                    # (útil para la corrida recurrente mensual programada).
 VENTANAS        = [6]               # ventana ESTÁNDAR: una sola ventana de 6 meses
 ESCALA_LOG      = True              # detección en escala log10 (recomendado para datos multiplicativos)
+
+# Derivación automática del mes para corridas recurrentes: mes calendario anterior a hoy.
+if AUTO_CODMES:
+    from datetime import date
+    _hoy = date.today()
+    _y, _m = (_hoy.year, _hoy.month - 1) if _hoy.month > 1 else (_hoy.year - 1, 12)
+    PARAM_CODMES = f"{_y:04d}{_m:02d}"
 
 # --- Parámetros del método base (fallback IQR/MAD) ---
 IQR_FACTOR      = 1.5               # cerca de Tukey (igual que las bandas)
@@ -602,13 +623,62 @@ outliers = (resultado
 
 
 # ============================================================================================
-#  6) ESCRITURA como TABLA del catálogo Glue (particionada por ventana)
+#  6) ESCRITURA en TABLA PERMANENTE ACUMULADA (particionada por codmes_val, ventana_meses)
 # ============================================================================================
-spark.sql(f"DROP TABLE IF EXISTS {TABLA_OUTLIERS}")
-(outliers.write.mode("overwrite").format("parquet")
-    .option("path", S3_OUTLIERS)
-    .partitionBy("ventana_meses")
-    .saveAsTable(TABLA_OUTLIERS))
+def _tabla_existe(tabla):
+    try:
+        return spark.catalog.tableExists(tabla)              # Spark 3.3+
+    except Exception:
+        db, t = (tabla.split(".", 1) + [None])[:2] if "." in tabla else (None, tabla)
+        try:
+            tablas = spark.catalog.listTables(db) if db else spark.catalog.listTables()
+            return any(x.name.lower() == t.lower() for x in tablas)
+        except Exception:
+            return False
+
+
+def _particiones_actuales(tabla):
+    """Devuelve la lista de columnas de partición de una tabla existente (o None si no se puede leer)."""
+    try:
+        return [c.name for c in spark.catalog.listColumns(tabla) if c.isPartition]
+    except Exception:
+        return None
+
+
+def escribir_acumulado(df, tabla, s3_path):
+    """Escribe el mes actual en una tabla permanente particionada por PART_COLS, ACUMULANDO meses:
+      · si la tabla no existe -> la crea (saveAsTable) con la partición (codmes_val, ventana_meses);
+      · si ya existe con la MISMA partición -> insertInto en modo overwrite dinámico: reemplaza SOLO
+        la(s) partición(es) del mes que se está corriendo y conserva el resto (idempotente por mes);
+      · si existe con OTRA partición (p.ej. la tabla antigua particionada solo por ventana_meses) ->
+        la recrea una vez con el nuevo esquema de partición.
+    NOTA de migración: si vienes de la versión anterior (partición solo por ventana_meses), la primera
+    corrida recreará la tabla. Conviene que el prefijo S3 esté limpio o usar uno nuevo para no mezclar
+    el layout de directorios antiguo con el nuevo."""
+    # Particiones al FINAL y en el orden de PART_COLS (insertInto resuelve por POSICIÓN).
+    data_cols = [c for c in df.columns if c not in PART_COLS]
+    df = df.select(*data_cols, *PART_COLS)
+
+    if not _tabla_existe(tabla):
+        (df.write.mode("overwrite").format("parquet")
+            .option("path", s3_path).partitionBy(*PART_COLS).saveAsTable(tabla))
+        print(f"[write] Tabla creada y particionada por {PART_COLS}: {tabla}")
+        return
+
+    parts = _particiones_actuales(tabla)
+    if parts is not None and [p.lower() for p in parts] != [p.lower() for p in PART_COLS]:
+        print(f"[write] Partición existente {parts} != {PART_COLS}; recreando tabla {tabla} (migración).")
+        spark.sql(f"DROP TABLE IF EXISTS {tabla}")
+        (df.write.mode("overwrite").format("parquet")
+            .option("path", s3_path).partitionBy(*PART_COLS).saveAsTable(tabla))
+        return
+
+    # Overwrite DINÁMICO: reemplaza solo la partición del mes corriente (codmes_val=PARAM_CODMES).
+    df.write.mode("overwrite").insertInto(tabla)
+    print(f"[write] Mes {PARAM_CODMES} volcado (overwrite dinámico de partición) en: {tabla}")
+
+
+escribir_acumulado(outliers, TABLA_OUTLIERS, S3_OUTLIERS)
 
 if ESCRIBIR_DIAG:
     # Detalle mes×combinación (todas las filas, sean outlier o no): permite auditar clusters,
@@ -623,11 +693,7 @@ if ESCRIBIR_DIAG:
         "limite_inf", "limite_sup", "limite_inf_iqr", "limite_sup_iqr",
         "dif_inf_p25_log", "dif_sup_p75_log", "pctl_valida_inf", "pctl_valida_sup",
         "mad", "mod_zscore", "es_outlier", "tipo")
-    spark.sql(f"DROP TABLE IF EXISTS {TABLA_DIAG}")
-    (diag.write.mode("overwrite").format("parquet")
-        .option("path", S3_DIAG)
-        .partitionBy("ventana_meses")
-        .saveAsTable(TABLA_DIAG))
+    escribir_acumulado(diag, TABLA_DIAG, S3_DIAG)
 
 
 # ============================================================================================
@@ -654,6 +720,15 @@ print("=== Criterio de aceptación: Venta TC / Marketing Contextual / Ventas / H
             "limite_inf_iqr", "es_outlier", "tipo")
     .orderBy("ventana_meses").show(truncate=False))
 
-print(f"Tabla de outliers creada: {TABLA_OUTLIERS}")
+print(f"Tabla de outliers (acumulada) actualizada para codmes={PARAM_CODMES}: {TABLA_OUTLIERS}")
 if ESCRIBIR_DIAG:
-    print(f"Tabla de detalle/diagnóstico creada: {TABLA_DIAG}")
+    print(f"Tabla de detalle/diagnóstico (acumulada) actualizada para codmes={PARAM_CODMES}: {TABLA_DIAG}")
+
+# Meses ya almacenados en la tabla acumulada (verificación rápida de la acumulación).
+print("=== Meses (codmes_val) almacenados en la tabla consolidada ===")
+(spark.table(TABLA_OUTLIERS)
+    .groupBy("codmes_val")
+    .agg(F.count(F.lit(1)).alias("n_filas"),
+         F.countDistinct("metrica", "canal_dsc", "flujo_dsc", "objetivo_dsc", "productos_dsc", "dia_semana")
+          .alias("combinaciones"))
+    .orderBy("codmes_val").show(truncate=False))
